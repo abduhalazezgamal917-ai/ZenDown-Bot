@@ -1,1 +1,1 @@
-web: python audio_service.py
+web: python app.py
