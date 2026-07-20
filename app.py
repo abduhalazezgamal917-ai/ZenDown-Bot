@@ -1,10 +1,11 @@
 import os
 import sys
 
-# إضافة المجلد الحالي للمسارات لحل مشكلة استيراد core
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# إجبار بايثون على قراءة المجلد الحالي كمسار رئيسي
+base_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, base_dir)
 
-# تشغيل البوت الأساسي
 if __name__ == "__main__":
+    print("جاري تشغيل البوت الأساسي...")
     import bot
-    bot.main()
+
