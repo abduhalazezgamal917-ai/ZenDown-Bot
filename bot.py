@@ -36,7 +36,7 @@ from telegram.ext import (
 )
 
 # ── إعداد السجلات أولاً ──────────────────────────────────────────────────────
-from core.config import (
+from config import (
     BOT_TOKEN,
     CACHE_TTL,
     HEALTH_PORT,
@@ -46,7 +46,7 @@ from core.config import (
     RATE_LIMIT_REQUESTS,
     RATE_LIMIT_WINDOW,
 )
-import core.config as cfg
+import config as cfg
 from utils.logging_setup import setup_logging
 
 setup_logging(LOG_LEVEL)
