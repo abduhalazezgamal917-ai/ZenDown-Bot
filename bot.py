@@ -1,3 +1,209 @@
+"""
+bot.py — نقطة الدخول لـ ZenDown Bot (نظام الاستقرار الكامل).
+
+طبقات الاستقرار:
+  Layer 1 (Python Watchdog) : إعادة تشغيل تلقائية داخلية (100 محاولة)
+  Layer 2 (Shell Watchdog)  : start.sh — exponential backoff (200 محاولة)
+  Layer 3 (Replit Workflow) : Replit يُعيد تشغيل العملية عند الإيقاف
+  Layer 4 (HTTP Server)     : /health و /ping على منفذ 8090
+  Layer 5 (Self-Keepalive)  : ping ذاتي كل 4 دقائق داخل event loop
+  Layer 6 (UptimeRobot)     : مراقبة خارجية كل 5 دقائق (يُعدّ خارجياً)
+
+إعدادات PTB للاستقرار:
+  - connect/read/write/pool timeout: 30s لكل منها
+  - connection_pool_size: 8 اتصالات متزامنة
+  - retry_on_conflict: True (خلل الجلسات)
+  - get_updates_*timeout: مُعيَّنة بشكل مستقل
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import signal
+import sys
+import time
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    filters,
+)
+
+# ── إعداد السجلات أولاً ──────────────────────────────────────────────────────
+from core.config import (
+    BOT_TOKEN,
+    CACHE_TTL,
+    HEALTH_PORT,
+    LOG_LEVEL,
+    MAX_CONCURRENT_DOWNLOADS,
+    MAX_CONCURRENT_PER_USER,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW,
+)
+import core.config as cfg
+from utils.logging_setup import setup_logging
+
+setup_logging(LOG_LEVEL)
+logger = logging.getLogger("zendown.bot")
+
+# ── المعالجات ─────────────────────────────────────────────────────────────────
+from handlers.callbacks import (
+    check_subscription_callback,
+    download_audio_callback,
+    download_video_callback,
+    pay_monthly_callback,
+    pay_once_callback,
+    pay_weekly_callback,
+    pre_checkout_query_handler,
+    refresh_stats_callback,
+    share_bot_callback,
+    successful_payment_handler,
+)
+from handlers.commands import (
+    forcejoin_command,
+    setchannel_command,
+    start_command,
+    stats_command,
+    stats_keyword_handler,
+)
+from handlers.errors import error_handler
+from handlers.messages import handle_message
+
+# ── الخدمات ───────────────────────────────────────────────────────────────────
+from services.cache import init_cache
+from services.download_service import close_http_session, init_http_session
+from services.queue_manager import init_queue
+from services.rate_limiter import init_rate_limiter
+from services.stats import init_stats
+from services.uptime_server import (
+    record_error,
+    set_running,
+    start_uptime_server,
+    stop_uptime_server,
+)
+
+# ── ثوابت ────────────────────────────────────────────────────────────────────
+_MAX_RESTARTS     = 100
+_RESTART_DELAY    = 3       # ثوانٍ بين محاولات Python watchdog
+_KEEPALIVE_SECS   = 240     # self-ping كل 4 دقائق
+_CONNECT_TIMEOUT  = 30.0    # ثوانٍ — timeout اتصال PTB
+_READ_TIMEOUT     = 30.0
+_WRITE_TIMEOUT    = 30.0
+_POOL_TIMEOUT     = 30.0
+_POOL_SIZE        = 8       # اتصالات HTTP متزامنة في pool PTB
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# مهام الخلفية
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _self_keepalive_loop() -> None:
+    """
+    Layer 5: Self-Keepalive
+    يُنفَّذ كل 4 دقائق داخل event loop:
+      • يُرسل GET /health لنفسه → يُبقي event loop نشطاً
+      • يُسجّل heartbeat في السجلات
+      • يتحقق من صحة خادم الـ uptime
+    """
+    import aiohttp
+
+    url = f"http://127.0.0.1:{HEALTH_PORT}/health"
+    await asyncio.sleep(30)   # انتظر حتى يستقر البوت
+
+    logger.info("💓 Self-Keepalive بدأ — يُنبض كل %ds", _KEEPALIVE_SECS)
+    consecutive_fails = 0
+
+    while True:
+        try:
+            await asyncio.sleep(_KEEPALIVE_SECS)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        consecutive_fails = 0
+                        logger.info(
+                            "💓 Heartbeat ✅ | uptime=%ds | errors=%d",
+                            data.get("uptime_secs", 0),
+                            data.get("errors", 0),
+                        )
+                    else:
+                        consecutive_fails += 1
+                        logger.warning("💓 Heartbeat ⚠️ status=%d", resp.status)
+        except asyncio.CancelledError:
+            logger.info("💓 Self-Keepalive أُوقف.")
+            break
+        except Exception as exc:
+            consecutive_fails += 1
+            logger.warning("💓 Heartbeat فشل (%d) : %s", consecutive_fails, exc)
+
+
+async def _cache_cleanup_loop() -> None:
+    """تنظيف الكاش والـ rate limiter كل 10 دقائق."""
+    from services.cache import get_cache
+    from services.rate_limiter import get_rate_limiter
+
+    while True:
+        try:
+            await asyncio.sleep(600)
+            evicted = await get_cache().evict_expired()
+            cleaned = await get_rate_limiter().cleanup()
+            if evicted or cleaned:
+                logger.debug("تنظيف: %d كاش | %d rate limiter", evicted, cleaned)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("خطأ في تنظيف الكاش.")
+
+
+async def _pending_cleanup_loop(application: Application) -> None:
+    """تنظيف الروابط المعلقة المنتهية الصلاحية كل 30 دقيقة."""
+    from handlers.messages import PENDING_TTL_SECS
+
+    while True:
+        try:
+            await asyncio.sleep(1800)
+            pending = application.bot_data.get("pending_dl", {})
+            now     = time.time()
+            expired = [k for k, v in list(pending.items())
+                       if now - v.get("timestamp", 0) > PENDING_TTL_SECS]
+            for k in expired:
+                pending.pop(k, None)
+            if expired:
+                logger.debug("تنظيف: %d رابط معلق منتهٍ.", len(expired))
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("خطأ في تنظيف الروابط.")
+
+
+async def _stats_autosave_loop() -> None:
+    """حفظ الإحصائيات تلقائياً كل 15 دقيقة."""
+    from services.stats import get_stats
+
+    while True:
+        try:
+            await asyncio.sleep(900)
+            await get_stats().save()
+            logger.debug("📊 إحصائيات محفوظة تلقائياً.")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("خطأ في الحفظ التلقائي للإحصائيات.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hooks دورة الحياة
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _post_init(application: Application) -> None:
+    """يُهيّئ جميع الخدمات ويُشغّل المهام الخلفية."""
+    logger.info("جاري تهيئة الخدمات...")
 
     await init_http_session()
     init_cache(ttl=CACHE_TTL)
@@ -7,39 +213,39 @@
     tracker = init_stats()
     await tracker.load()
 
-    # â”€â”€ طھط´ط؛ظٹظ„ ط§ظ„ظ…ظ‡ط§ظ… ط§ظ„ط®ظ„ظپظٹط© â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── تشغيل المهام الخلفية ──────────────────────────────────────────────────
     loop = asyncio.get_event_loop()
     loop.create_task(_cache_cleanup_loop(),                  name="cache-cleanup")
     loop.create_task(_pending_cleanup_loop(application),     name="pending-cleanup")
     loop.create_task(_stats_autosave_loop(),                 name="stats-autosave")
     loop.create_task(_self_keepalive_loop(),                 name="self-keepalive")   # Layer 5
 
-    # â”€â”€ Layer 4: ط®ط§ط¯ظ… HTTP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Layer 4: خادم HTTP ────────────────────────────────────────────────────
     cfg.BOT_START_TIME = time.time()
     try:
         runner = await start_uptime_server(port=HEALTH_PORT)
         application.bot_data["uptime_runner"] = runner
         logger.info(
-            "ًںŒگ ط®ط§ط¯ظ… ط§ظ„طµط­ط© ط¹ظ„ظ‰ ط§ظ„ظ…ظ†ظپط° %d â†’ UptimeRobot: ط£ط¶ظپ /ping ظ„ظ…ط±ط§ظ‚ط¨طھظƒ",
+            "🌐 خادم الصحة على المنفذ %d → UptimeRobot: أضف /ping لمراقبتك",
             HEALTH_PORT,
         )
     except Exception as exc:
-        logger.warning("طھط¹ط°ظ‘ط± طھط´ط؛ظٹظ„ ط®ط§ط¯ظ… ط§ظ„طµط­ط©: %s", exc)
+        logger.warning("تعذّر تشغيل خادم الصحة: %s", exc)
 
     set_running(True)
-    logger.info("âœ… ط¬ظ…ظٹط¹ ط§ظ„ط®ط¯ظ…ط§طھ ط¬ط§ظ‡ط²ط©.")
+    logger.info("✅ جميع الخدمات جاهزة.")
 
 
 async def _post_shutdown(application: Application) -> None:
-    """ظٹظڈط؛ظ„ظ‚ ط§ظ„ظ…ظˆط§ط±ط¯ ظˆظٹط­ظپط¸ ط§ظ„ط¨ظٹط§ظ†ط§طھ ط¹ظ†ط¯ ط§ظ„ط¥ظٹظ‚ط§ظپ."""
-    logger.info("ط¬ط§ط±ظٹ ط§ظ„ط¥ط؛ظ„ط§ظ‚ ط§ظ„ظ†ط¸ظٹظپ...")
+    """يُغلق الموارد ويحفظ البيانات عند الإيقاف."""
+    logger.info("جاري الإغلاق النظيف...")
     set_running(False)
 
     from services.stats import get_stats
     try:
         await get_stats().save()
     except Exception:
-        logger.exception("ظپط´ظ„ ط­ظپط¸ ط§ظ„ط¥ط­طµط§ط¦ظٹط§طھ.")
+        logger.exception("فشل حفظ الإحصائيات.")
 
     await close_http_session()
 
@@ -47,43 +253,43 @@ async def _post_shutdown(application: Application) -> None:
     if runner:
         await stop_uptime_server(runner)
 
-    logger.info("âœ… طھظ… ط§ظ„ط¥ط؛ظ„ط§ظ‚ ط§ظ„ظ†ط¸ظٹظپ.")
+    logger.info("✅ تم الإغلاق النظيف.")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# ط¨ظ†ط§ط، ط§ظ„طھط·ط¨ظٹظ‚
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────────────────────────────────────
+# بناء التطبيق
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _build_app() -> Application:
     """
-    ظٹط¨ظ†ظٹ Application ط¨ط¥ط¹ط¯ط§ط¯ط§طھ PTB ط§ظ„ظ…ظڈط­ط³ظژظ‘ظ†ط© ظ„ظ„ط§ط³طھظ‚ط±ط§ط±:
-      â€¢ timeouts: 30s ظ„ظƒظ„ ط¹ظ…ظ„ظٹط©
-      â€¢ connection_pool_size: 8 ط§طھطµط§ظ„ط§طھ ظ…طھط²ط§ظ…ظ†ط©
-      â€¢ get_updates_*: timeout ظ…ط³طھظ‚ظ„ ظ„ظ€ polling
+    يبني Application بإعدادات PTB المُحسَّنة للاستقرار:
+      • timeouts: 30s لكل عملية
+      • connection_pool_size: 8 اتصالات متزامنة
+      • get_updates_*: timeout مستقل لـ polling
     """
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        # â”€â”€ Timeouts ط§طھطµط§ظ„ HTTP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Timeouts اتصال HTTP ───────────────────────────────────────────────
         .connect_timeout(_CONNECT_TIMEOUT)
         .read_timeout(_READ_TIMEOUT)
         .write_timeout(_WRITE_TIMEOUT)
         .pool_timeout(_POOL_TIMEOUT)
         .connection_pool_size(_POOL_SIZE)
-        # â”€â”€ Timeouts polling (get_updates) ظ…ط³طھظ‚ظ„ط© â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Timeouts polling (get_updates) مستقلة ────────────────────────────
         .get_updates_connect_timeout(_CONNECT_TIMEOUT)
-        .get_updates_read_timeout(60.0)   # polling ظٹط­طھط§ط¬ ظˆظ‚طھط§ظ‹ ط£ط·ظˆظ„
+        .get_updates_read_timeout(60.0)   # polling يحتاج وقتاً أطول
         .get_updates_write_timeout(_WRITE_TIMEOUT)
         .get_updates_pool_timeout(_POOL_TIMEOUT)
-        # â”€â”€ Hooks ط¯ظˆط±ط© ط§ظ„ط­ظٹط§ط© â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Hooks دورة الحياة ─────────────────────────────────────────────────
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
-        # â”€â”€ طھظپط¹ظٹظ„ ط§ظ„طھط­ط¯ظٹط«ط§طھ ط§ظ„ظ…طھط²ط§ظ…ظ†ط© â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── تفعيل التحديثات المتزامنة ─────────────────────────────────────────
         .concurrent_updates(True)
         .build()
     )
 
-    # â”€â”€ ط§ط®طھظٹط§ط± ظ†ظˆط¹ ط§ظ„ظˆط³ط§ط¦ط· â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── اختيار نوع الوسائط ──────────────────────────────────────────────────
     app.add_handler(CommandHandler("start",      start_command))
     app.add_handler(CommandHandler("setchannel", setchannel_command))
     app.add_handler(CommandHandler("forcejoin",  forcejoin_command))
@@ -92,77 +298,77 @@ def _build_app() -> Application:
     app.add_handler(CallbackQueryHandler(download_video_callback, pattern=r"^dl_video:"))
     app.add_handler(CallbackQueryHandler(download_audio_callback, pattern=r"^dl_audio:"))
 
-    # â”€â”€ ط§ظ„ط¯ظپط¹ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── الدفع ────────────────────────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(pay_once_callback,    pattern=r"^pay_once:"))
     app.add_handler(CallbackQueryHandler(pay_weekly_callback,  pattern=r"^pay_weekly:"))
     app.add_handler(CallbackQueryHandler(pay_monthly_callback, pattern=r"^pay_monthly:"))
     app.add_handler(PreCheckoutQueryHandler(pre_checkout_query_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
-    # â”€â”€ ط§ظ„ط£ط²ط±ط§ط± ط§ظ„ط£ط®ط±ظ‰ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── الأزرار الأخرى ───────────────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
     app.add_handler(CallbackQueryHandler(share_bot_callback,          pattern="^share_bot$"))
     app.add_handler(CallbackQueryHandler(refresh_stats_callback,      pattern="^refresh_stats$"))
 
-    # â”€â”€ ط§ظ„ظƒظ„ظ…ط§طھ ط§ظ„ظ…ظپطھط§ط­ظٹط© ظ„ظ„ظ…ط´ط±ظپ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── الكلمات المفتاحية للمشرف ─────────────────────────────────────────────
     _stats_filter = filters.TEXT & ~filters.COMMAND & filters.Regex(
-        r"^(ط¥ط­طµط§ط¦ظٹط§طھ|ط§ط­طµط§ط¦ظٹط§طھ|stats|ط§ظ„ط¥ط­طµط§ط¦ظٹط§طھ)$"
+        r"^(إحصائيات|احصائيات|stats|الإحصائيات)$"
     )
     app.add_handler(MessageHandler(_stats_filter, stats_keyword_handler))
 
-    # â”€â”€ ط§ظ„ط±ط³ط§ط¦ظ„ ط§ظ„ظ†طµظٹط© â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── الرسائل النصية ───────────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # â”€â”€ ظ…ط¹ط§ظ„ط¬ ط§ظ„ط£ط®ط·ط§ط، â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── معالج الأخطاء ────────────────────────────────────────────────────────
     app.add_error_handler(error_handler)
 
     return app
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────────────────────────────────────
 # Layer 1: Python Watchdog
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ──────────────────────────────────────────────────────────────────────────────
 
 _shutdown_requested = False
 
 
 def _handle_signal(signum: int, frame) -> None:
-    """ظ…ط¹ط§ظ„ط¬ ط¥ط´ط§ط±ط§طھ SIGTERM/SIGINT ظ„ظ„ط¥ظٹظ‚ط§ظپ ط§ظ„ظ†ط¸ظٹظپ."""
+    """معالج إشارات SIGTERM/SIGINT للإيقاف النظيف."""
     global _shutdown_requested
     sig_name = signal.Signals(signum).name
-    logger.info("ًں“، ط§ط³طھظڈظ‚ط¨ظ„طھ ط¥ط´ط§ط±ط© %s â€” ط¨ط¯ط، ط§ظ„ط¥ظٹظ‚ط§ظپ ط§ظ„ظ†ط¸ظٹظپ...", sig_name)
+    logger.info("📡 استُقبلت إشارة %s — بدء الإيقاف النظيف...", sig_name)
     _shutdown_requested = True
 
 
 def main() -> None:
     """
-    ظ†ظ‚ط·ط© ط§ظ„ط¯ط®ظˆظ„ ط§ظ„ط±ط¦ظٹط³ظٹط© ظ…ط¹ Python watchdog.
+    نقطة الدخول الرئيسية مع Python watchdog.
 
-    طھط³ظ„ط³ظ„ ط§ظ„ط§ط³طھظ‚ط±ط§ط±:
-      1. طھط³ط¬ظٹظ„ ظ…ط¹ط§ظ„ط¬ط§طھ SIGTERM/SIGINT
-      2. ط¨ظ†ط§ط، Application ط¨ط¥ط¹ط¯ط§ط¯ط§طھ PTB ط§ظ„ظ…ظڈط­ط³ظژظ‘ظ†ط©
-      3. run_polling ظ…ط¹ ط¥ط¹ط§ط¯ط© طھط´ط؛ظٹظ„ طھظ„ظ‚ط§ط¦ظٹط© ط¹ظ†ط¯ ط§ظ„ط§ظ†ظ‡ظٹط§ط±
-      4. طھط£ط®ظٹط± ط¨ظٹظ† ط§ظ„ظ…ط­ط§ظˆظ„ط§طھ ظ„ظ…ظ†ط¹ CPU spike
+    تسلسل الاستقرار:
+      1. تسجيل معالجات SIGTERM/SIGINT
+      2. بناء Application بإعدادات PTB المُحسَّنة
+      3. run_polling مع إعادة تشغيل تلقائية عند الانهيار
+      4. تأخير بين المحاولات لمنع CPU spike
     """
-    # â”€â”€ طھط³ط¬ظٹظ„ ظ…ط¹ط§ظ„ط¬ط§طھ ط§ظ„ط¥ط´ط§ط±ط© â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── تسجيل معالجات الإشارة ────────────────────────────────────────────────
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT,  _handle_signal)
 
-    logger.info("â•گ" * 55)
-    logger.info("  ZenDown Bot ظٹط¨ط¯ط£")
-    logger.info("  Layer 1: Python Watchdog (%d ظ…ط­ط§ظˆظ„ط© | delay=%ds)", _MAX_RESTARTS, _RESTART_DELAY)
+    logger.info("═" * 55)
+    logger.info("  ZenDown Bot يبدأ")
+    logger.info("  Layer 1: Python Watchdog (%d محاولة | delay=%ds)", _MAX_RESTARTS, _RESTART_DELAY)
     logger.info("  Layer 2: Shell Watchdog  (start.sh)")
     logger.info("  Layer 3: Replit Workflow auto-restart")
     logger.info("  Layer 4: HTTP /health /ping (port %d)", HEALTH_PORT)
-    logger.info("  Layer 5: Self-Keepalive (ظƒظ„ %ds)", _KEEPALIVE_SECS)
-    logger.info("â•گ" * 55)
+    logger.info("  Layer 5: Self-Keepalive (كل %ds)", _KEEPALIVE_SECS)
+    logger.info("═" * 55)
 
     for attempt in range(1, _MAX_RESTARTS + 1):
         if _shutdown_requested:
-            logger.info("ط¥ظٹظ‚ط§ظپ ظ†ط¸ظٹظپ ظ…ط·ظ„ظˆط¨ â€” ط®ط±ظˆط¬.")
+            logger.info("إيقاف نظيف مطلوب — خروج.")
             break
 
-        logger.info("â–¶ ظ…ط­ط§ظˆظ„ط© %d/%d", attempt, _MAX_RESTARTS)
+        logger.info("▶ محاولة %d/%d", attempt, _MAX_RESTARTS)
         t_start = time.monotonic()
 
         try:
@@ -172,34 +378,34 @@ def main() -> None:
                 drop_pending_updates=True,
                 close_loop=False,
             )
-            logger.info("âœ… ط§ظ„ط¨ظˆطھ ط£ظڈظˆظ‚ظپ ط¨ط´ظƒظ„ ظ†ط¸ظٹظپ.")
+            logger.info("✅ البوت أُوقف بشكل نظيف.")
             break
 
         except KeyboardInterrupt:
-            logger.info("âŒ¨ï¸ڈ  Ctrl+C â€” ط¥ظٹظ‚ط§ظپ ظٹط¯ظˆظٹ.")
+            logger.info("⌨️  Ctrl+C — إيقاف يدوي.")
             break
 
         except SystemExit as exc:
             if exc.code == 0:
-                logger.info("âœ… SystemExit(0) â€” ط®ط±ظˆط¬ ظ†ط¸ظٹظپ.")
+                logger.info("✅ SystemExit(0) — خروج نظيف.")
                 break
-            logger.warning("SystemExit(%s) â€” ظ‚ط¯ ظٹظڈط¹ط§ط¯ ط§ظ„طھط´ط؛ظٹظ„.", exc.code)
+            logger.warning("SystemExit(%s) — قد يُعاد التشغيل.", exc.code)
 
         except Exception as exc:
             runtime = time.monotonic() - t_start
             record_error()
             logger.error(
-                "â‌Œ ط§ظ†ظ‡ظٹط§ط± ط¨ط¹ط¯ %.1fs (ظ…ط­ط§ظˆظ„ط© %d): %s",
+                "❌ انهيار بعد %.1fs (محاولة %d): %s",
                 runtime, attempt, exc, exc_info=True,
             )
 
         if attempt < _MAX_RESTARTS and not _shutdown_requested:
-            logger.info("âڈ³ ط¥ط¹ط§ط¯ط© ط®ظ„ط§ظ„ %ds...", _RESTART_DELAY)
+            logger.info("⏳ إعادة خلال %ds...", _RESTART_DELAY)
             time.sleep(_RESTART_DELAY)
 
-    logger.info("â•گ" * 55)
-    logger.info("  ZenDown Bot ط£ظڈظˆظ‚ظپ â€” sys.exit(0)")
-    logger.info("â•گ" * 55)
+    logger.info("═" * 55)
+    logger.info("  ZenDown Bot أُوقف — sys.exit(0)")
+    logger.info("═" * 55)
     sys.exit(0)
 
 
